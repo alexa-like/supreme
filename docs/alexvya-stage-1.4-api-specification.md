@@ -1,0 +1,562 @@
+# Alexvya — Stage 1.4: Firebase + Next.js API Specification
+
+**Document Version:** 1.2.0 (Final Locked Specification)  
+**Status:** PASS — LOCKED (Stage 1.4 API Specification)  
+**Project:** Alexvya Digital Services Platform  
+**Target Infrastructure:** Next.js (App Router) / TypeScript / Firebase Authentication / Cloud Firestore / Firebase Admin SDK / Paystack / VTpass / ClubKonnect / Resend  
+**Current Stage:** Stage 1.4 (Firebase + Next.js API Specification)  
+**Preceding Stages:**  
+- `docs/alexvya-stage-0-project-foundation.md`  
+- `docs/alexvya-stage-1-product-blueprint.md`  
+- `docs/alexvya-stage-1.1-firestore-database-architecture.md`  
+- `docs/alexvya-stage-1.2-provider-pricing-architecture.md`  
+- `docs/alexvya-stage-1.3-firebase-security-architecture.md`
+
+---
+
+## 1. API Architecture & Request Lifecycle
+
+Alexvya utilizes Next.js App Router Route Handlers (`app/api/v1/.../route.ts`) executing in the trusted Node.js server runtime. Direct browser communication with downstream providers or database credentials is strictly prohibited.
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                        UNTRUSTED CLIENT LAYER                          │
+│   Browser / React Components / Mobile Web (Firebase Auth Client SDK)   │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ HTTPS + Bearer ID Token / App Check
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   NEXT.JS SERVER ROUTE HANDLERS (/api/v1/*)            │
+│  1. Transport & App Check Validation (reCAPTCHA Enterprise)            │
+│  2. Firebase ID Token Verification (Admin SDK Auth: uid, email, status)│
+│  3. Database Role Authorization (`adminUsers/{uid}` lookup if admin)   │
+│  4. Zod Schema Input Sanitization & Parameter Validation               │
+│  5. Tiered Idempotency Check (`idempotencyKeys/{key}`)                 │
+│  6. Authoritative Pricing & Margin Calculation (`serviceProducts`)     │
+│  7. Atomic Firestore Transaction Execution (`runTransaction`)          │
+└─────────────┬─────────────────────┬──────────────────────┬─────────────┘
+              │ Read/Write          │ Outbound API         │ Outbound API
+              ▼                     ▼                      ▼
+    ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+    │  Cloud Firestore │  │ Paystack Gateway │  │ VTpass / ClubK   │
+    │ (Admin SDK Priv) │  │ (Card / USSD)    │  │ (VAS Vend APIs)  │
+    └──────────────────┘  └──────────────────┘  └──────────────────┘
+```
+
+---
+
+## 2. API Design Principles & Financial Authority Invariants
+
+Every API route handler strictly enforces the following core invariants:
+1. **The Browser is Untrusted:** The client never supplies authoritative prices, provider costs, markups, discounts, wallet balances, or provider selections.
+2. **Strict Integer-Kobo Arithmetic:** All monetary operations are calculated and stored in integer kobo ($1 \text{ NGN} = 100 \text{ kobo}$). Floating-point arithmetic is strictly prohibited across all server endpoints.
+3. **Atomic State Mutation:** All wallet balance changes, ledger entries, and transaction state locks execute inside Firestore atomic transactions (`runTransaction`).
+4. **Provider Responses are Untrusted Input:** External vendor responses and webhooks are validated and normalized before database persistence.
+5. **Zero Client-Side Finalization:** The client cannot finalize a transaction, mark an order successful, or trigger an unverified refund.
+
+---
+
+## 3. Global API Conventions & Response Envelopes
+
+### 3.1 Base Path & Versioning
+All API endpoints follow the immutable base path: `/api/v1/`.
+
+### 3.2 Standard Success Response Envelope
+```typescript
+export interface ApiSuccessResponse<T> {
+  success: true;
+  data: T;
+  meta?: {
+    request_id: string;
+    timestamp: string; // ISO 8601 UTC (e.g. "2026-09-23T12:00:00.000Z")
+    pagination?: {
+      total: number;
+      page: number;
+      limit: number;
+      has_more: boolean;
+      cursor?: string | null;
+    };
+  };
+}
+```
+
+### 3.3 Standard Error Response Envelope
+```typescript
+export interface ApiErrorResponse {
+  success: false;
+  error: {
+    code: string; // Machine-readable enum (e.g. "INSUFFICIENT_BALANCE")
+    message: string; // Safe, human-readable message
+    request_id: string; // Unique correlation ID (e.g. "req_01HV...")
+    field_errors?: Array<{
+      field: string;
+      message: string;
+    }>;
+  };
+}
+```
+
+### 3.4 Request Headers
+- `Authorization`: `Bearer <Firebase_ID_Token>` (Required for authenticated customer/admin endpoints).
+- `X-Firebase-AppCheck`: `<App_Check_Token>` (Required for browser client requests).
+- `Idempotency-Key`: `<UUIDv4>` (Mandatory on state-mutating POST/PATCH operations).
+- `X-Request-ID`: `<UUIDv4>` (Optional client correlation ID; generated by server if omitted).
+- `Content-Type`: `application/json`.
+
+---
+
+## 4. Multi-Tier Idempotency & Deduplication Model
+
+To guarantee financial safety, Alexvya enforces distinct deduplication retention windows aligned with Stage 1.1:
+
+| Operation Category | Header / Key Mechanism | Retention Window | Storage Collection | Collision / Retry Behavior |
+|---|---|---|---|---|
+| **VAS Purchase Orders** (Airtime, Data, Bills) | `Idempotency-Key` (UUIDv4) | **24 Hours** | `idempotencyKeys` | Returns existing transaction if payload hash matches; returns `409 Conflict` if payload differs or request is currently in-flight. |
+| **Wallet Funding Initialization** | `Idempotency-Key` (UUIDv4) | **72 Hours** | `idempotencyKeys` | Returns existing initialized Paystack checkout URL and transaction reference without creating duplicate checkout sessions. |
+| **Payment Verification Deduplication** | Paystack Reference (`ALX-FND-...`) | **90 Days** | `paymentAttempts` | Prevents duplicate wallet credit upon repeated checkout redirects or callback replays. |
+| **Third-Party Webhook Events** | `SHA256(provider + event_id + ref)` | **30 Days** | `webhookEvents` | Acknowledges receipt (`200 OK`) and drops duplicate webhook processing without duplicate ledger writes. |
+| **Refunds & Admin Wallet Adjustments** | Parent Transaction Ref (`ALX-RFD-...`) | **Permanent** | `transactions` & `wallets/ledger` | Permanent unique deduplication lock preventing duplicate refunds on the same root transaction. |
+
+---
+
+## 5. Authentication & Session Synchronization API
+
+Identity creation, email verification links, and password resets are managed directly by the **Firebase Authentication Client SDK**. Alexvya provides server endpoints to synchronize profile states and enforce account gating.
+
+### 5.1 `POST /api/v1/auth/sync-profile`
+- **Purpose:** Synchronizes newly authenticated Firebase user with Firestore `users/{userId}` and provisions an empty `wallets/{userId}` on initial registration.
+- **Auth:** Authenticated User (`CUSTOMER`).
+- **Request Body:** `{}` (UID and email extracted from verified ID token).
+- **Firestore Operations:**
+  - `READ`: `users/{userId}`, `wallets/{userId}`.
+  - `TRANSACTIONAL CREATE`: `users/{userId}` (if not exists), `wallets/{userId}` (initial balance `0` kobo).
+- **Success (200 OK):** Returns synchronized user object and initial wallet state.
+
+---
+
+## 6. Customer Profile & Tier/Funding Policy API
+
+### 6.1 `GET /api/v1/user/profile`
+- **Purpose:** Retrieve the authenticated customer's profile, configured account tier, daily limits, and notification preferences.
+- **Auth:** Authenticated User (`CUSTOMER`, self only).
+- **Firestore Operations:** `READ users/{userId}`.
+
+### 6.2 `PATCH /api/v1/user/profile`
+- **Purpose:** Update permitted customer profile fields.
+- **Auth:** Authenticated User (`CUSTOMER`, self only).
+- **Validation (Zod):**
+  - Permitted Keys: `first_name` (string, max 50), `last_name` (string, max 50), `display_name` (string, max 50), `phone_number` (E.164 string), `notification_preferences` (object).
+  - Prohibited Keys: `account_status`, `kyc_tier`, `email_verified`, `role`, `daily_funding_limit_kobo` (Rejected with `400 Bad Request`).
+- **Firestore Operations:** `UPDATE users/{userId}`.
+
+### 6.3 Configurable Account Tier & Funding Limit Policy
+> **Architecture vs. Operational Policy Distinction:**
+> - **Locked Architectural Financial Constraints (Stage 1.1):**
+>   - Minimum single VAS purchase: ₦50 (5,000 kobo)
+>   - Maximum single VAS order: ₦100,000 (10,000,000 kobo)
+>   - Maximum account balance: ₦10,000,000 (1,000,000,000 kobo)
+> - **Configurable Operational Policies:**
+>   - Single funding thresholds and daily limits (`daily_funding_limit_kobo`, `daily_transaction_limit_kobo`) are stored as dynamic attributes on `users/{userId}` or system configuration.
+>   - For example, an initial Tier 1 default of ₦50,000/day (5,000,000 kobo/day) or a single deposit cap of ₦50,000 is a configurable V1 operational policy default, not a permanent architectural maximum.
+>   - Funding limits may be adjusted higher or lower based on risk/tier policies, provided they never allow an account balance to exceed the locked maximum account balance architectural invariant of ₦10,000,000 (1,000,000,000 kobo).
+>   - Tier limits do not represent a hardcoded statutory compliance claim.
+
+---
+
+## 7. Customer Wallet & Balance API
+
+### 7.1 `GET /api/v1/wallet/balance`
+- **Purpose:** Retrieve customer's authoritative available, ledger, and locked balances.
+- **Auth:** Authenticated User (`CUSTOMER`, self only).
+- **Firestore Operations:** `READ wallets/{userId}`.
+- **Success (200 OK):**
+```json
+{
+  "success": true,
+  "data": {
+    "wallet_id": "usr_firebase_uid_123",
+    "currency": "NGN",
+    "available_balance_kobo": 250000,
+    "available_balance_formatted": "₦2,500.00",
+    "ledger_balance_kobo": 250000,
+    "locked_balance_kobo": 0,
+    "status": "ACTIVE",
+    "updated_at": "2026-09-23T12:00:00Z"
+  },
+  "meta": { "request_id": "req_bal_001", "timestamp": "2026-09-23T12:00:00Z" }
+}
+```
+
+### 7.2 `GET /api/v1/wallet/ledger`
+- **Purpose:** Chronological query of customer's single-account immutable balance journal.
+- **Auth:** Authenticated User (`CUSTOMER`, self only).
+- **Query Parameters:** `page` (int, default 1), `limit` (int, default 20, max 50), `entry_type` (`CREDIT` | `DEBIT`), `cursor` (string).
+- **Firestore Operations:** `READ wallets/{userId}/ledger` (Composite index: `user_id` ASC, `created_at` DESC).
+
+---
+
+## 8. Wallet Funding API (Paystack Integration Lifecycle)
+
+### 8.1 `POST /api/v1/wallet/fund/initialize`
+- **Purpose:** Initialize a Paystack checkout transaction for customer wallet deposit.
+- **Auth:** Authenticated User (`CUSTOMER`, verified email required).
+- **Header:** `Idempotency-Key: <UUIDv4>` (72-hour retention).
+- **Request Body:**
+```json
+{
+  "amount_kobo": 100000,
+  "callback_url": "https://alexvya.com/wallet/fund/callback"
+}
+```
+- **Server Execution:**
+  - Validate amount bounds against configured operational funding policy (V1 operational policy default: `5000 <= amount_kobo <= 5000000`, i.e., ₦50 to ₦50,000 per transaction).
+  - Enforce locked account balance invariant: `wallets/{userId}.available_balance_kobo + amount_kobo <= 1000000000` (₦10,000,000 max account balance).
+  - Verify configured daily limit: `users/{userId}.daily_spent_kobo + amount_kobo <= daily_funding_limit_kobo`.
+  - Generate internal reference: `ALX-FND-YYYYMMDD-XXXXXX`.
+  - Call Paystack API `/transaction/initialize` with metadata `{ user_id, transaction_ref }`.
+  - Create `paymentAttempts/{attemptId}` (`status: "PENDING"`).
+  - Create `transactions/{transactionId}` (`type: "WALLET_FUNDING"`, `status: "PENDING"`).
+- **Success (201 Created):** Returns authorization URL and access code.
+
+### 8.2 `GET /api/v1/wallet/fund/verify/:reference`
+- **Purpose:** Query payment settlement status following customer redirect back from Paystack.
+- **Auth:** Authenticated User (`CUSTOMER`, self only).
+- **Server Execution:**
+  - Read `paymentAttempts/{attemptId}` matching reference.
+  - If already `SUCCESSFUL`, return settled state immediately (90-day deduplication).
+  - If `PENDING`, query Paystack REST API `/transaction/verify/:reference`.
+  - If verified successful, execute atomic transaction crediting `wallets/{userId}`, appending `wallets/{userId}/ledger`, and marking `transactions/{id}` as `SUCCESSFUL`.
+
+---
+
+## 9. Public & Customer Product Catalog API
+
+### 9.1 `GET /api/v1/catalog/services`
+- **Purpose:** Publicly query active VAS categories and operational statuses.
+- **Auth:** Public. Cache: `s-maxage=300, stale-while-revalidate=60`.
+
+### 9.2 `GET /api/v1/catalog/airtime`
+- **Purpose:** Retrieve active telco networks and customer discounts.
+- **Auth:** Public. (Wholesale provider costs and profit margins strictly omitted).
+
+### 9.3 `GET /api/v1/catalog/data`
+- **Purpose:** Retrieve available data bundles grouped by network and plan type.
+- **Auth:** Public. (Exposes retail `selling_price_kobo`, data volume MB, validity days).
+
+### 9.4 `GET /api/v1/catalog/electricity`
+- **Purpose:** Retrieve supported Electricity Discos and convenience fees.
+- **Auth:** Public.
+
+### 9.5 `GET /api/v1/catalog/cable-tv`
+- **Purpose:** Retrieve Cable TV operators and available bouquet packages.
+- **Auth:** Public.
+
+---
+
+## 10. Value-Added Services (VAS) Purchase APIs
+
+### 10.1 Airtime Purchase API (`POST /api/v1/services/airtime/purchase`)
+- **Auth:** Authenticated User (`CUSTOMER`, verified email).
+- **Header:** `Idempotency-Key: <UUIDv4>` (24-hour retention).
+- **Request Body:** `{ "network": "MTN", "phone_number": "08031234567", "amount_kobo": 100000 }`.
+- **Server Execution Pipeline:**
+  1. Validate phone number and amount bounds.
+  2. Query `serviceProducts/prod_airtime_mtn` to resolve active discount (basis points) and provider mapping.
+  3. Compute selling price server-side using floor integer arithmetic.
+  4. Query `ProviderRouter` for active provider.
+  5. Execute atomic Firestore transaction:
+     - Verify `wallets/{userId}.available_balance_kobo >= selling_price_kobo`.
+     - Debit `wallets/{userId}`.
+     - Append `wallets/{userId}/ledger` (`entry_type: "DEBIT"`, `category: "AIRTIME_PURCHASE"`).
+     - Create `transactions/{transactionId}` and `airtimeOrders/{orderId}` with status `"PENDING"`.
+  6. Dispatch outbound HTTPS call to selected provider adapter.
+  7. If `SUCCESS`: Update order & transaction to `"SUCCESSFUL"`, settle gross profit.
+  8. If ambiguous timeout: Keep status `"PENDING"`, trigger unified requery schedule.
+  9. If immediate permanent failure: Mark `"FAILED"`, execute atomic wallet refund.
+
+### 10.2 Mobile Data Purchase API (`POST /api/v1/services/data/purchase`)
+- **Auth:** Authenticated User (`CUSTOMER`, verified email).
+- **Header:** `Idempotency-Key: <UUIDv4>` (24-hour retention).
+- **Request Body:** `{ "product_id": "prod_mtn_data_1gb_sme", "phone_number": "08031234567" }`.
+
+### 10.3 Electricity Bill Payment APIs
+#### A. Validate Meter Number (`POST /api/v1/services/electricity/validate-meter`)
+- **Auth:** Authenticated User (`CUSTOMER`).
+- **Request Body:** `{ "disco_code": "IKEDC", "meter_number": "01234567890", "meter_type": "PREPAID" }`.
+- **Response:** Returns validated customer legal name and address (Non-financial, zero wallet debit).
+
+#### B. Purchase Electricity Token (`POST /api/v1/services/electricity/purchase`)
+- **Auth:** Authenticated User (`CUSTOMER`, verified email).
+- **Header:** `Idempotency-Key: <UUIDv4>` (24-hour retention).
+- **Request Body:** `{ "disco_code": "IKEDC", "meter_number": "01234567890", "meter_type": "PREPAID", "customer_name": "JOHN DOE", "amount_kobo": 500000 }`.
+- **Normalized Token Response Representation:**
+```json
+{
+  "success": true,
+  "data": {
+    "transaction_reference": "ALX-PWR-20260923-481902",
+    "status": "SUCCESSFUL",
+    "token_data": {
+      "token": "1234-5678-9012-3456-7890",
+      "token_type": "STS_STANDARD",
+      "units": "68.4 kWh",
+      "receipt_number": "REC-IKEDC-992019",
+      "token_metadata": {
+        "bsst_token": null,
+        "disco_reference": "IKD_TX_881920"
+      }
+    },
+    "amount_kobo": 510000,
+    "customer_name": "JOHN DOE"
+  }
+}
+```
+
+### 10.4 Cable TV Subscription APIs
+#### A. Validate Smartcard (`POST /api/v1/services/cable-tv/validate-smartcard`)
+- **Auth:** Authenticated User (`CUSTOMER`).
+- **Request Body:** `{ "operator": "DSTV", "smartcard_number": "1029384756" }`.
+
+#### B. Purchase Cable Subscription (`POST /api/v1/services/cable-tv/purchase`)
+- **Auth:** Authenticated User (`CUSTOMER`, verified email).
+- **Header:** `Idempotency-Key: <UUIDv4>` (24-hour retention).
+- **Request Body:** `{ "product_id": "prod_dstv_compact", "smartcard_number": "1029384756", "customer_name": "JOHN DOE" }`.
+
+---
+
+## 11. Universal Transaction & Order Status Architecture
+
+### 11.1 Authoritative Customer Transaction Source of Truth
+> **Architecture Invariant:** The `transactions` collection is the **single customer-facing source of truth** for all financial states. Domain-specific collections (`serviceOrders`, `airtimeOrders`, `dataOrders`, `billOrders`, `providerTransactions`) serve as internal operational audit records.
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│               Authoritative Customer Entity: transactions              │
+│       - status: PENDING | SUCCESSFUL | FAILED | REFUNDED | UNKNOWN     │
+│       - original_economics (Frozen at initiation)                      │
+│       - settlement_economics (Adjusted upon lifecycle completion)      │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ State Synchronized via Admin SDK
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│               Operational Audit Entities (Domain-Specific)             │
+│  - serviceOrders / airtimeOrders / dataOrders / billOrders             │
+│  - providerTransactions / webhookEvents / auditLogs                    │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 `GET /api/v1/transactions`
+- **Purpose:** Customer paginated transaction history.
+- **Auth:** Authenticated User (`CUSTOMER`, self only).
+
+### 11.3 `GET /api/v1/transactions/:transactionId`
+- **Purpose:** Retrieve single transaction status and normalized token/receipt metadata.
+- **Auth:** Authenticated User (Owner) or `ADMIN` / `SUPER_ADMIN` / `AUDITOR`.
+
+### 11.4 `GET /api/v1/transactions/:transactionId/receipt`
+- **Purpose:** Retrieve formal customer receipt for successful transactions.
+- **Auth:** Authenticated User (Owner) or `ADMIN` / `SUPER_ADMIN` / `AUDITOR`.
+
+---
+
+## 12. Customer Notifications API
+
+- **`GET /api/v1/notifications`**: Retrieve customer's in-app notification feed.
+- **`GET /api/v1/notifications/unread-count`**: Lightweight unread counter for badge display.
+- **`PATCH /api/v1/notifications/:id/read`**: Mark specific notification as read.
+- **`POST /api/v1/notifications/mark-all-read`**: Mark all notifications as read.
+
+---
+
+## 13. Inbound Webhook APIs
+
+### 13.1 `POST /api/v1/webhooks/paystack`
+- **Purpose:** Ingest Paystack deposit confirmation events.
+- **Auth:** HMAC-SHA512 signature in `X-Paystack-Signature` header verified using `PAYSTACK_SECRET_KEY` via constant-time comparison (`crypto.timingSafeEqual`).
+- **Processing Logic:**
+  1. Capture raw unparsed body buffer.
+  2. Validate HMAC signature.
+  3. Compute deterministic event hash: `SHA256("PAYSTACK" + event.id + data.reference)`.
+  4. Check `webhookEvents/{eventHash}`; if exists & `PROCESSED`, return `200 OK` immediately (30-day retention).
+  5. Re-verify transaction status with Paystack REST API (`/transaction/verify/:ref`).
+  6. Execute atomic Firestore transaction:
+     - Credit `wallets/{userId}`.
+     - Append `wallets/{userId}/ledger` (`category: "WALLET_FUNDING"`).
+     - Update `paymentAttempts/{id}` and `transactions/{id}` to `SUCCESSFUL`.
+     - Mark `webhookEvents/{eventHash}` as `PROCESSED`.
+  7. Return `200 OK`.
+
+### 13.2 `POST /api/v1/webhooks/vtpass` & `POST /api/v1/webhooks/clubkonnect`
+- **Security Invariant:** Receipt of an unauthenticated provider callback **never directly mutates financial state**. It queues an authoritative status requery (`/requery`) to verify the order before updating database records.
+
+---
+
+## 14. Refunds, Reversals, Wallet Restorations & Adjustments
+
+The platform distinguishes 5 distinct financial lifecycle operations:
+
+```text
+1. Automatic Refund (System):
+   Triggered immediately when provider returns an explicit permanent failure.
+   Action: Credits customer wallet (+amount) & appends ledger journal "REFUND".
+
+2. Provider Reversal (Wholesale):
+   Provider cancels order post-acceptance and returns wholesale cost to merchant balance.
+   Action: Updates providerTransactions and settlement_economics.reversal_amount_kobo.
+
+3. Customer Wallet Restoration (Staff/Admin):
+   Initiated by staff after manual confirmation of non-delivery.
+   Action: Restores customer wallet balance via atomic transaction.
+
+4. Manual Wallet Adjustment (Super-Admin):
+   Administrative balance correction subject to the mandatory Two-Man Rule for high-risk operations exceeding the configured operational policy threshold (e.g., V1 operational policy default: >₦10,000 / 1,000,000 kobo).
+   Action: Requires dual Super-Admin approvals with mandatory structured audit log reason before wallet mutation executes.
+
+5. Multi-Way Reconciliation:
+   Automated 4-way matching of transactions, ledgers, Paystack, and provider balances.
+```
+
+### 14.1 `POST /api/v1/admin/transactions/:transactionId/refund`
+- **Auth:** `ADMIN` or `SUPER_ADMIN`.
+- **Validation:** Transaction must be in `FAILED` or `UNKNOWN` state; `settlement_economics.refund_amount_kobo` must be `0`.
+- **Request Body:** `{ "reason": "Customer confirmed un-vended meter; provider confirmed failure." }`.
+- **Execution:**
+  - Preserves frozen `original_economics` untouched.
+  - Updates `settlement_economics.refund_amount_kobo = original_customer_charged_kobo`.
+  - Updates `settlement_economics.net_recognized_profit_kobo = 0`.
+  - Executes atomic wallet credit (+amount) and appends `wallets/{userId}/ledger`.
+  - Logs immutable entry in `auditLogs`.
+
+---
+
+## 15. Reconciliation & Provider Requery Engine
+
+### 15.1 Exact Locked Requery Eligibility Schedule
+When an ambiguous provider timeout or network drop occurs, the transaction enters `PENDING` and follows the exact locked requery schedule:
+
+```text
+Time T0: Ambiguous Network Timeout Occurs (Transaction Marked PENDING)
+  │
+  ├─► T0 + 30s:   Initial Quick Probe (Attempt 1)
+  ├─► T0 + 90s:   Scheduled Polling (Attempt 2 - 60s later)
+  ├─► T0 + 150s:  Scheduled Polling (Attempt 3 - 60s later)
+  ├─► T0 + 210s:  Scheduled Polling (Attempt 4 - 60s later)
+  ├─► T0 + 270s:  Scheduled Polling (Attempt 5 - 60s later)
+  │
+  └─► T0 + 300s (5 Minutes Elapsed): Maximum Automated Polling Window Reached
+        │
+        ▼
+      Set transaction.status = "UNKNOWN"
+      Set serviceOrders.requires_manual_reconciliation = true
+      Escalate to Administrative Manual Investigation Queue
+```
+
+### 15.2 Ambiguous Timeout Invariants
+An ambiguous provider timeout **MUST NOT**:
+- Automatically fail the transaction.
+- Automatically reroute the order to a fallback provider (Risk of double vending).
+- Automatically refund the customer wallet (Risk of free service).
+- Assume provider failure.
+
+---
+
+## 16. Administrative Governance & Control APIs
+
+Administrative endpoints enforce Layer 2 Authorization: the server queries `adminUsers/{userId}` directly and verifies `is_active == true` before executing any privileged logic.
+
+### 16.1 Comprehensive Administrative Authorization Matrix
+
+| Operational Action | Customer | Admin | Super Admin | Auditor | System (Workers) | Two-Man Rule Required? |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Inspect Platform Users** | ❌ | ✅ | ✅ | ✅ | ✅ | No |
+| **Freeze / Suspend User Account** | ❌ | ❌ | ✅ | ❌ | ✅ (Automated Guard) | No |
+| **Inspect Global Transactions** | ❌ | ✅ | ✅ | ✅ | ✅ | No |
+| **Trigger Manual Order Requery** | ❌ | ✅ | ✅ | ❌ | ✅ | No |
+| **Issue Approved Customer Refund** | ❌ | ✅ | ✅ | ❌ | ✅ (Automated) | No |
+| **Manual Wallet Adjustment (Below configured policy threshold, e.g. V1 default $\le \text{₦}10,000$)** | ❌ | ❌ | ✅ | ❌ | ❌ | No (Audit Reason Required) |
+| **Manual Wallet Adjustment (Above configured policy threshold, e.g. V1 default $> \text{₦}10,000$)** | ❌ | ❌ | ✅ | ❌ | ❌ | **YES (Dual Super-Admin Approval — Configurable Operational Policy)** |
+| **Inspect Product Catalog & Wholesale Costs** | ❌ | ✅ | ✅ | ✅ | ✅ | No |
+| **Modify Catalog Pricing, Discounts & Fees** | ❌ | ✅ | ✅ | ❌ | ❌ | No (Audit Reason Required) |
+| **Modify Provider Routing & Priority** | ❌ | ❌ | ✅ | ❌ | ❌ | No (Audit Reason Required) |
+| **Reset Circuit Breakers** | ❌ | ❌ | ✅ | ❌ | ✅ (Automated Cooldown) | No |
+| **Inspect Webhook Logs & Retries** | ❌ | ✅ | ✅ | ✅ | ✅ | No |
+| **Resolve UNKNOWN Reconciliation Orders** | ❌ | ✅ | ✅ | ❌ | ❌ | No (Audit Reason Required) |
+| **Inspect Immutable Audit Logs** | ❌ | ✅ (Operational) | ✅ (Full) | ✅ (Full) | ❌ | No |
+| **Manage / Assign Administrative Roles** | ❌ | ❌ | ✅ | ❌ | ❌ | **Zero Self-Assignment** |
+
+---
+
+## 17. Background Worker & Scheduled Task APIs
+
+Background workers execute maintenance, requeries, and health checks. These endpoints are protected via **Google Cloud OIDC Service Account Authentication** (`Authorization: Bearer <Google_OIDC_Token>`).
+
+### 17.1 Worker Invariants
+- **Non-Public Endpoints:** Workers cannot be invoked by normal browser clients or customer tokens.
+- **Server-Side Execution Only:** Executes privileged logic using Admin SDK service credentials.
+- **Strictly Idempotent:** Worker tasks can run repeatedly without causing duplicate balance changes or redundant requery spam.
+- **Observable & Auditable:** All worker executions log structured telemetry and record outcomes in `auditLogs` upon state transitions.
+
+### 17.2 Worker Endpoints
+- `POST /api/v1/workers/requery-pending`: Scans `serviceOrders` matching the locked T+30s to T+300s schedule.
+- `POST /api/v1/workers/health-check`: Pings VAS providers, updates latencies and circuit breaker probe states.
+
+---
+
+## 18. Comprehensive Error Model & HTTP Status Mapping
+
+Domain transaction states are strictly decoupled from HTTP transport status codes:
+
+| Error Code | HTTP Status | Domain Transaction State | Retryable? | Recommended Action |
+|---|:---:|:---:|:---:|---|
+| `UNAUTHENTICATED` | 401 | N/A | No | Authenticate with Firebase Auth and pass valid Bearer ID token. |
+| `FORBIDDEN` | 403 | N/A | No | Access denied. Role not permitted or account suspended. |
+| `ACCOUNT_SUSPENDED` | 403 | N/A | No | Account frozen. Contact Alexvya compliance support. |
+| `EMAIL_NOT_VERIFIED` | 403 | N/A | No | Verify email address before initiating financial transactions. |
+| `INVALID_INPUT` | 422 | N/A | No | Fix field validation errors in request payload. |
+| `INSUFFICIENT_BALANCE` | 400 | `FAILED` | No | Fund wallet before attempting VAS purchase. |
+| `DAILY_LIMIT_EXCEEDED`| 400 | `FAILED` | No | Deposit or purchase exceeds configured account daily limit. |
+| `IDEMPOTENCY_CONFLICT`| 409 | `IN_FLIGHT` | No | In-flight request in progress with same Idempotency-Key. |
+| `RATE_LIMITED` | 429 | N/A | Yes | Back off and retry after `Retry-After` seconds. |
+| `PROVIDER_UNAVAILABLE` | 503 | `FAILED` | Yes | Aggregator offline and no fallback available. Retry later. |
+| `PROVIDER_TIMEOUT` | 504 | `PENDING` | No | Ambiguous timeout. Order is processing; poll transaction status. |
+| `RECONCILIATION_REQUIRED`| 200 / 202 | `UNKNOWN` | No | 5-minute automated window exceeded. Awaiting manual admin review. |
+| `INTERNAL_ERROR` | 500 | `FAILED` | No | Internal server error logged with correlation ID. |
+
+---
+
+## 19. Firestore Interaction Contract & Schema Impact Audit
+
+### 19.1 UNCHANGED Collections (from Stage 1.1)
+`wallets`, `wallets/{userId}/ledger`, `paymentAttempts`, `serviceOrders`, `airtimeOrders`, `dataOrders`, `billOrders`, `providerTransactions`, `webhookEvents`, `notifications`, `auditLogs`, `idempotencyKeys`.
+
+### 19.2 MODIFIED Collections (Locked Modifications from Stages 1.2 & 1.3)
+- **`transactions/{transactionId}`**:
+  - `financial_snapshot`: Formally structured into immutable `original_economics` (frozen at initiation) and mutable `settlement_economics` (lifecycle adjustments).
+- **`serviceProducts/{productId}`**:
+  - `min_margin_kobo`: Added integer kobo margin floor guard.
+- **`providers/{providerId}`**:
+  - `circuit_breaker_state`: Enum (`CLOSED`, `OPEN`, `HALF_OPEN`).
+  - `circuit_breaker_opened_at`: Timestamp.
+- **`users/{userId}`**:
+  - `account_status`: Enum (`ACTIVE`, `SUSPENDED`, `FROZEN`, `CLOSED`).
+  - `email_verified`: Boolean verification flag.
+- **`adminUsers/{userId}`**:
+  - `is_active`: Boolean operational flag.
+  - `role`: Enum (`ADMIN`, `SUPER_ADMIN`, `AUDITOR`).
+  - `assigned_by`: Staff UID who granted the role.
+
+### 19.3 NEW Collections
+- **None.** The existing 17 collections and subcollections provide 100% structural coverage for all API operations.
+
+---
+
+## 20. Stage Consistency Audit & Architectural Sign-Off
+
+- **Stage 1 (Product Blueprint):** 100% Aligned (Airtime, Data, Electricity, Cable TV, Paystack funding, Admin oversight).
+- **Stage 1.1 (Firestore Database):** 100% Aligned (Integer kobo, single-account wallet ledger, immutable audit trail, retention rules).
+- **Stage 1.2 (Provider & Pricing):** 100% Aligned (Financial snapshot economics, Provider Router, Circuit Breaker, T+30s to T+300s requery lifecycle, UNKNOWN state).
+- **Stage 1.3 (Firebase Security):** 100% Aligned (Zero-trust server authority, Dual-Layer admin authorization, Secret isolation, Two-Man rule).
+
+---
+
+**STAGE 1.4 COMPLETE — PROCEED ONLY TO STAGE 1.5 UPON EXPLICIT USER INSTRUCTION.**
